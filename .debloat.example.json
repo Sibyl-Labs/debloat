@@ -1,0 +1,6 @@
+{
+  "surface": ["CLAUDE.md", "AGENTS.md", ".claude/rules.md"],
+  "thresholds": { "watch": 45000, "heavy": 55000 },
+  "perFileSoft": { "CLAUDE.md": 6000 },
+  "journal": ".debloat/history.jsonl"
+}
