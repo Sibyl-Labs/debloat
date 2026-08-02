@@ -1,0 +1,4 @@
+interface:
+  display_name: "Debloat"
+  short_description: "Measure and safely trim agent context"
+  default_prompt: "Use $debloat to measure my always-loaded context and prepare a verified trim plan."
