@@ -1,68 +1,96 @@
 ---
 name: debloat
-description: Measure and trim your AI agent's always-load context - the instruction, rule, and state files it reads on every session start. Use when the user says 'debloat', '/debloat', 'context bloat', 'how heavy is my context', 'trim startup context', 'context weight', or 'my startup is bloated'. Environment hygiene, not a gate: it measures and suggests; you choose what to trim.
+description: Measure and safely trim the instruction, rule, and state files that AI coding agents load into every session. Use for debloat, /debloat, context bloat, startup context, context weight, oversized AGENTS.md or CLAUDE.md files, and accumulated agent history. Support Codex, Claude Code, Cursor, and standalone use. Measure first, require an explicit target choice, preview an exact diff, and never trim immutable records.
 ---
 
-# /debloat - context hygiene for the always-load surface
+# Debloat agent context
 
-Deterministically measures what your agent loads on EVERY session start (its instruction files,
-rules, and any always-read state files) and, on demand, runs a trim pass you drive. Pure
-byte/token arithmetic (chars/4, labelled `MEASURED~`), no LLM judgment, so the number cannot be
-rationalized away. Environment hygiene, not a gate: it never blocks a session and never forces a
-trim. You choose what (if anything) to move.
+Measure the persistent context surface, identify accumulated history, and move only user-approved
+line ranges through a deterministic, backed-up workflow. Treat the token number as an estimate,
+not an exact tokenizer count.
 
-Measurement core: `context-hygiene.mjs` (this skill dir). Modes: `--fyi` (one line), `--json`
-(drives the trim picker), default (full report).
+The skill directory contains two scripts:
 
-## Configure the surface (.debloat.json)
+- `context-hygiene.mjs`: discover and measure context files.
+- `trim-context.mjs`: preview and apply a verified trim plan.
 
-The tool measures the files you declare "always-loaded." Put a `.debloat.json` in your project
-root:
+Run scripts with `node <skill-directory>/<script>`. Do not assume a `.claude` or `.agents` install
+path. Use the actual directory containing this `SKILL.md`.
+
+## Measure
+
+1. Select the active agent with `--agent codex`, `--agent claude`, or `--agent cursor`. Use the
+   default automatic discovery only when the active agent is unknown.
+2. Run:
+
+   ```bash
+   node <skill-directory>/context-hygiene.mjs --agent <agent> --json
+   ```
+
+3. Report `total_tokens_estimate`, `total_characters`, `total_bytes`, `weight`, the heaviest files,
+   duplicate aliases, missing explicit files, and suggested targets.
+4. If the surface is light and has no targets, stop.
+
+Discovery follows each agent's current instruction conventions. It includes only unconditional
+Claude and Cursor rules. Configured `surface` entries and repeated `--include` values supplement
+discovery. Use `--no-discover` to measure only explicit files.
+
+## Prepare a trim
+
+1. Ask which suggested file the user wants to trim. Never infer approval from measurement alone.
+2. Read the selected file and separate current instructions from dated logs, superseded notes, and
+   event history.
+3. Never select immutable logs, transaction records, generated audit trails, secrets, or data whose
+   retention semantics are unclear.
+4. Create `.debloat/trim-plan.json` with inclusive, one-based line ranges:
+
+   ```json
+   {
+     "source": "AGENTS.md",
+     "history": "AGENTS-history.md",
+     "pointer": "Historical notes: see [AGENTS-history.md](AGENTS-history.md).",
+     "ranges": [{ "start": 42, "end": 78 }]
+   }
+   ```
+
+5. Preview the complete affected diff:
+
+   ```bash
+   node <skill-directory>/trim-context.mjs --plan .debloat/trim-plan.json --dry-run
+   ```
+
+6. Show the diff and ask for explicit approval. Do not edit the source or history file directly.
+   Keep the printed review token. It binds approval to the exact source, history, and plan content.
+
+## Apply and verify
+
+After approval, run:
+
+```bash
+node <skill-directory>/trim-context.mjs --plan .debloat/trim-plan.json --apply --review-token <token-from-dry-run>
+```
+
+The script must create a backup before writing, preserve extracted bytes inside marked history
+blocks, write atomically, compare SHA-256 hashes, and roll back on failed verification. It refuses
+source symlinks that resolve outside the project root and rejects changes made after preview.
+
+Re-run measurement and report the before and after estimate, changed files, backup directory, and
+verification result.
+
+## Configure
+
+Read `.debloat.json` from the inspected root by default:
 
 ```json
 {
-  "surface": ["CLAUDE.md", "AGENTS.md", ".claude/rules.md"],
-  "thresholds": { "watch": 45000, "heavy": 55000 },
-  "perFileSoft": { "CLAUDE.md": 6000 }
+  "agents": ["codex"],
+  "discover": true,
+  "surface": ["docs/always-loaded-state.md"],
+  "thresholds": { "watch": 8000, "heavy": 16000 },
+  "perFileSoft": { "*": 4000, "AGENTS.md": 6000 },
+  "journal": ".debloat/history.jsonl"
 }
 ```
 
-No config? It defaults to `CLAUDE.md` + `AGENTS.md`. You can also list files on the CLI with
-`--include <path>` (repeatable), set the root with `--root <dir>`, and point at a config with
-`--config <path>`.
-
-## Two modes
-
-### 1. Startup FYI (one line, ignorable - good for a session-start hook)
-
-```
-node .claude/skills/debloat/context-hygiene.mjs --fyi
-```
-
-Emits ONE line, e.g. `context: ~48.3k tok always-load (watch) | heavy: rules.md 10223t - /debloat to trim`.
-Surface it and move on. It is FYI, not an action item. Weight labels: `light` (< watch) /
-`watch` (>= watch, or a heavy file present) / `heavy` (>= heavy).
-
-### 2. On-demand /debloat (interactive trim pass)
-
-1. **Measure** - `node .claude/skills/debloat/context-hygiene.mjs --json`. Parse `total_tok`,
-   `weight`, `files[]` (per-file weight), `targets[]` (heavy files).
-2. **Show** the weight + the heaviest files + the suggested targets. If `weight === 'light'` and
-   no targets, report "light, nothing to trim" and stop.
-3. **Ask** which target(s) to trim (never trim without an explicit choice).
-4. **Extract** each chosen target:
-   - Identify the accreted HISTORY (dated log prose, superseded notes, event history) versus the
-     current live state.
-   - Append that history to a matching `*-history` file (create if absent). Leave the source file
-     with current state + a one-line pointer to the history file.
-   - **NEVER delete data.** Extraction = move to history + keep a pointer. Immutable or append-only
-     records (logs, transaction/entry data) are off-limits: surface them, do not trim.
-5. **Re-measure** with `--json` and report the before/after `total_tok` drop so you see it landed.
-   Validate any JSON file you edit (`node -e "JSON.parse(require('fs').readFileSync('<path>','utf8'))"`).
-
-## Rules
-
-- Environment hygiene, never a gate. Non-blocking. You select; nothing is forced.
-- Never delete data - extract accreted history to a `*-history` file and leave a pointer.
-- Never trim immutable/append-only records or transaction data.
-- The token count is `chars/4` (`MEASURED~`), a deterministic proxy, not an exact tokenizer count.
+Keep journal paths inside the inspected root. Treat `unicode_characters/4` as a deterministic proxy.
+Do not describe it as an exact token count or proof of the context actually injected by an agent.

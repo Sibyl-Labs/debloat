@@ -1,0 +1,13 @@
+{
+  "name": "@sibyl-labs/debloat",
+  "version": "1.1.0",
+  "description": "Context hygiene for AI coding agents",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

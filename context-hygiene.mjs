@@ -1,155 +1,147 @@
 #!/usr/bin/env node
-// context-hygiene.mjs - deterministic measurement of an AI agent's always-load context surface.
-//
-// "debloat" measures what your agent loads on EVERY session start (its instruction files, rules,
-// and any always-read state files) and reports the weight plus the heaviest files, so you can keep
-// the always-load surface light. Pure byte/token arithmetic (chars/4, labelled MEASURED~), no LLM
-// judgment, so the number cannot be rationalized away.
-//
-// Environment hygiene, not a gate: it never blocks a session and never forces a trim. You decide.
-//
-// Modes:
-//   --fyi     one quiet line (weight + heavy spots). Good for a session-start hook.
-//   --json    machine-readable record (drives an interactive trim pass).
-//   (default) full human report: file weights + suggested trim targets.
-//
-// Config (optional): a .debloat.json in the root, or --config <path>:
-//   { "surface": ["CLAUDE.md", "AGENTS.md"],
-//     "thresholds": { "watch": 45000, "heavy": 55000 },
-//     "perFileSoft": { "CLAUDE.md": 6000 },
-//     "journal": ".debloat/history.jsonl" }
-// You can also list files on the CLI with --include <path> (repeatable).
-//
-// Always exits 0. Node 18+ (no dependencies).
-// Usage: node context-hygiene.mjs [--fyi|--json] [--root <dir>] [--config <path>] [--include <path>]...
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { DebloatConfigError, loadConfig, measureSurface } from './lib/context-surface.mjs';
 
 const args = process.argv.slice(2);
-const flag = (n) => args.includes(n);
-const opt = (n, d) => { const i = args.indexOf(n); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
-const opts = (n) => { const out = []; for (let i = 0; i < args.length; i++) if (args[i] === n && args[i + 1]) out.push(args[i + 1]); return out; };
-
-const ROOT = path.resolve(opt('--root', process.cwd()));
-const AS_JSON = flag('--json');
-const AS_FYI = flag('--fyi');
-
-// ---- config resolution -------------------------------------------------------------------
-const DEFAULTS = {
-  surface: ['CLAUDE.md', 'AGENTS.md'],
-  thresholds: { watch: 45000, heavy: 55000 },
-  perFileSoft: {},
-  journal: null, // set to a path (relative to root or absolute) to enable append-only telemetry
+const hasFlag = (name) => args.includes(name);
+const option = (name, fallback) => {
+  const index = args.indexOf(name);
+  return index >= 0 && args[index + 1] ? args[index + 1] : fallback;
 };
-function loadConfig() {
-  const cfgPath = opt('--config', path.join(ROOT, '.debloat.json'));
-  if (fs.existsSync(cfgPath)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-      return {
-        ...DEFAULTS, ...parsed,
-        thresholds: { ...DEFAULTS.thresholds, ...(parsed.thresholds || {}) },
-        perFileSoft: { ...DEFAULTS.perFileSoft, ...(parsed.perFileSoft || {}) },
-      };
-    } catch (e) { console.error(`debloat: could not parse ${cfgPath}: ${e.message}`); }
-  }
-  return { ...DEFAULTS };
-}
-const CFG = loadConfig();
+const options = (name) => args.flatMap((arg, index) => arg === name && args[index + 1] ? [args[index + 1]] : []);
 
-// surface = config surface + any --include, de-duplicated
-const surfaceList = [...new Set([...(CFG.surface || []), ...opts('--include')])];
+if (hasFlag('--help')) {
+  console.log(`Usage: node context-hygiene.mjs [options]
 
-const tok = (bytes) => Math.round(bytes / 4); // deterministic approx (chars/4), labelled MEASURED~
-
-// ---- MEASURE (deterministic) -------------------------------------------------------------
-const files = [];
-let totalBytes = 0;
-for (const rel of surfaceList) {
-  const abs = path.isAbsolute(rel) ? rel : path.join(ROOT, rel);
-  let bytes = 0;
-  try { const st = fs.statSync(abs); if (!st.isFile()) continue; bytes = st.size; } catch { continue; }
-  totalBytes += bytes;
-  const t = tok(bytes);
-  const soft = CFG.perFileSoft[rel];
-  files.push({ file: rel, bytes, tok: t, soft: soft ?? null, heavy: soft != null && t > soft });
-}
-const totalTok = tok(totalBytes);
-const WATCH = CFG.thresholds.watch, HEAVY = CFG.thresholds.heavy;
-
-// suggested trim targets (informational)
-const targets = [];
-for (const f of files) if (f.heavy) {
-  targets.push({ kind: 'file_heavy', file: f.file, tok: f.tok, soft: f.soft,
-    suggestion: `${f.file} is ${f.tok} tok (soft ${f.soft}). Move accreted history to a *-history file; keep current state + a pointer.` });
-}
-if (!targets.length && files.length && totalTok >= WATCH) {
-  const biggest = [...files].sort((a, b) => b.tok - a.tok)[0];
-  targets.push({ kind: 'file_largest', file: biggest.file, tok: biggest.tok, soft: biggest.soft,
-    suggestion: `${biggest.file} is the heaviest at ${biggest.tok} tok. If it carries accreted history, extract it to a *-history file.` });
-}
-
-// weight label (informational, never blocks)
-let weight = 'light';
-if (totalTok >= HEAVY) weight = 'heavy';
-else if (totalTok >= WATCH || targets.length) weight = 'watch';
-
-const record = {
-  ts: new Date().toISOString(), root: ROOT, total_tok: totalTok, total_bytes: totalBytes,
-  ref: { watch: WATCH, heavy: HEAVY }, weight,
-  files: files.map((f) => ({ file: f.file, tok: f.tok, soft: f.soft, heavy: f.heavy })),
-  targets: targets.map((t) => ({ file: t.file, kind: t.kind, tok: t.tok, soft: t.soft, suggestion: t.suggestion })),
-};
-
-// ---- OBSERVE: optional append-only telemetry (best-effort, never throws) ------------------
-if (CFG.journal) {
-  try {
-    const jp = path.isAbsolute(CFG.journal) ? CFG.journal : path.join(ROOT, CFG.journal);
-    fs.mkdirSync(path.dirname(jp), { recursive: true });
-    fs.appendFileSync(jp, JSON.stringify({ ts: record.ts, total_tok: totalTok, weight, targets: targets.length }) + '\n');
-  } catch { /* telemetry is best-effort */ }
-}
-
-// ---- OUTPUT ------------------------------------------------------------------------------
-if (AS_JSON) { console.log(JSON.stringify(record, null, 2)); process.exit(0); }
-
-if (AS_FYI) {
-  const heavyList = files.filter((f) => f.heavy).map((f) => `${f.file.split('/').pop()} ${f.tok}t`);
-  const spots = heavyList.length ? ` | heavy: ${heavyList.join(', ')}` : '';
-  const hint = weight === 'light' ? '' : ' - /debloat to trim';
-  console.log(`context: ~${(totalTok / 1000).toFixed(1)}k tok always-load (${weight})${spots}${hint}`);
+Options:
+  --fyi                 Print one summary line
+  --json                Print a machine-readable report
+  --root <dir>          Set the working directory to inspect
+  --config <path>       Set the config path, relative to root by default
+  --agent <name>        Inspect codex, claude, cursor, auto, or all (repeatable)
+  --include <path>      Add a file to the measured surface (repeatable)
+  --no-discover         Measure only configured and included files
+  --help                Show this help`);
   process.exit(0);
 }
 
-const bar = '='.repeat(60);
+const requestedRoot = path.resolve(option('--root', process.cwd()));
+if (!fs.existsSync(requestedRoot) || !fs.statSync(requestedRoot).isDirectory()) {
+  console.error(`debloat: root must be an existing directory: ${requestedRoot}`);
+  process.exit(1);
+}
+const root = fs.realpathSync(requestedRoot);
+let config;
+try {
+  config = loadConfig({ root, configPath: option('--config', null) });
+} catch (error) {
+  const message = error instanceof DebloatConfigError ? error.message : `unexpected config error: ${error.message}`;
+  console.error(`debloat: ${message}`);
+  process.exit(1);
+}
+
+let record;
+try {
+  record = measureSurface({
+    root,
+    config,
+    includes: options('--include'),
+    cliAgents: options('--agent'),
+    discover: config.discover && !hasFlag('--no-discover'),
+  });
+} catch (error) {
+  const message = error instanceof DebloatConfigError ? error.message : `measurement failed: ${error.message}`;
+  console.error(`debloat: ${message}`);
+  process.exit(1);
+}
+
+if (config.journal) {
+  try {
+    const journalPath = path.resolve(root, config.journal);
+    const relative = path.relative(root, journalPath);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      throw new Error('journal must stay inside the inspected root');
+    }
+    let existingParent = path.dirname(journalPath);
+    while (!fs.existsSync(existingParent)) existingParent = path.dirname(existingParent);
+    const realParent = fs.realpathSync(existingParent);
+    const realParentRelative = path.relative(root, realParent);
+    if (realParentRelative.startsWith('..') || path.isAbsolute(realParentRelative)) {
+      throw new Error('journal parent symlink must stay inside the inspected root');
+    }
+    if (fs.existsSync(journalPath)) {
+      const realJournal = fs.realpathSync(journalPath);
+      const realJournalRelative = path.relative(root, realJournal);
+      if (realJournalRelative.startsWith('..') || path.isAbsolute(realJournalRelative)) {
+        throw new Error('journal symlink must stay inside the inspected root');
+      }
+    }
+    fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+    fs.appendFileSync(journalPath, `${JSON.stringify({
+      ts: record.ts,
+      total_tokens_estimate: record.total_tokens_estimate,
+      total_characters: record.total_characters,
+      total_bytes: record.total_bytes,
+      weight: record.weight,
+      targets: record.targets.length,
+    })}\n`);
+  } catch (error) {
+    console.error(`debloat: could not write journal: ${error.message}`);
+    process.exit(1);
+  }
+}
+
+if (hasFlag('--json')) {
+  console.log(JSON.stringify(record, null, 2));
+  process.exit(0);
+}
+
+if (hasFlag('--fyi')) {
+  const heavyFiles = record.files.filter((file) => file.heavy).map((file) => `${path.basename(file.file)} ~${file.estimated_tokens}t`);
+  const spots = heavyFiles.length ? ` | heavy: ${heavyFiles.join(', ')}` : '';
+  const hint = record.weight === 'light' ? '' : ' | run /debloat to inspect';
+  console.log(`context: ~${(record.total_tokens_estimate / 1000).toFixed(1)}k tokens (${record.weight})${spots}${hint}`);
+  process.exit(0);
+}
+
+const bar = '='.repeat(72);
 console.log(bar);
 console.log(`CONTEXT WEIGHT  ${record.ts}`);
 console.log(bar);
-if (!files.length) {
-  console.log('  no always-load files found.');
-  console.log(`  looked for: ${surfaceList.join(', ') || '(none)'}`);
-  console.log('  set "surface" in .debloat.json or pass --include <file>.');
+if (!record.files.length) {
+  console.log('  no always-load files found');
+  console.log('  use --agent, --include, or configure surface in .debloat.json');
+  if (record.missing.length) console.log(`  missing explicit files: ${record.missing.join(', ')}`);
   console.log(bar);
   process.exit(0);
 }
-console.log(`  always-load surface: ${totalTok.toLocaleString()} tok  (~${(totalBytes / 1024).toFixed(0)} KB)   [MEASURED~ chars/4]`);
-console.log(`  reference: light <${WATCH / 1000}k / watch <${HEAVY / 1000}k / heavy >=${HEAVY / 1000}k`);
-console.log(`  weight: ${weight}`);
+
+console.log(`  agents: ${record.agents.join(', ') || 'custom surface only'}`);
+console.log(`  estimated tokens: ${record.total_tokens_estimate.toLocaleString()} [ESTIMATED~ unicode characters/4]`);
+console.log(`  characters: ${record.total_characters.toLocaleString()}`);
+console.log(`  bytes: ${record.total_bytes.toLocaleString()}`);
+console.log(`  reference: light <${record.ref.watch.toLocaleString()} / watch <${record.ref.heavy.toLocaleString()} / heavy >=${record.ref.heavy.toLocaleString()}`);
+console.log(`  weight: ${record.weight}`);
 console.log('');
-console.log('  file weights (heaviest first):');
-for (const f of [...files].sort((a, b) => b.tok - a.tok)) {
-  const mark = f.heavy ? '  <-- heavy (soft ' + f.soft + ')' : (f.soft ? '  (soft ' + f.soft + ')' : '');
-  console.log(`    ${String(f.tok).padStart(6)} tok  ${f.file}${mark}`);
+console.log('  file weights (heaviest first, symlinks counted once):');
+for (const file of record.files) {
+  const mark = file.heavy ? `  <-- heavy (soft ${file.soft})` : file.soft ? `  (soft ${file.soft})` : '';
+  const aliasNote = file.aliases.length > 1 ? `  [aliases: ${file.aliases.slice(1).join(', ')}]` : '';
+  console.log(`    ${String(file.estimated_tokens).padStart(6)} tok  ${String(file.characters).padStart(7)} chars  ${String(file.bytes).padStart(7)} bytes  ${file.file}${mark}${aliasNote}`);
 }
-if (targets.length) {
+if (record.missing.length) {
   console.log('');
-  console.log('  suggested trim targets (you choose what moves):');
-  for (const t of targets) console.log(`    * ${t.suggestion}`);
+  console.log(`  missing explicit files: ${record.missing.join(', ')}`);
+}
+if (record.targets.length) {
+  console.log('');
+  console.log('  suggested trim targets:');
+  for (const target of record.targets) console.log(`    * ${target.suggestion}`);
 }
 console.log('');
-console.log(weight === 'light'
-  ? '  Light. Nothing to do.'
-  : '  Trim: move accreted history out of the heavy files into *-history files, keep current state + a pointer.');
+console.log(record.weight === 'light'
+  ? '  Light. Nothing to trim.'
+  : '  Review the suggested files. Use a verified trim plan before moving history.');
 console.log(bar);
-process.exit(0);

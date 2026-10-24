@@ -1,115 +1,164 @@
 # debloat
 
-**Context hygiene for AI coding agents.** Measure the files your agent re-reads on every session
-start, and trim the accreted history out of them, without deleting anything.
+Context hygiene for AI coding agents. Measure persistent instruction files, find accumulated
+history, and move selected line ranges through a previewed, backed-up, verified workflow.
 
-Your AI coding agent (Claude Code, Cursor, and friends) loads a set of instruction, rule, and
-state files on **every** session start. That "always-load surface" quietly grows: a `CLAUDE.md`
-that accretes months of notes, a rules file that never gets pruned, state files carrying old
-narrative. The heavier it gets, the more of every session's context window is spent before you
-type a word.
+`debloat` supports Codex, Claude Code, Cursor, and standalone use. It has no runtime dependencies
+and requires Node.js 18 or newer.
 
-`debloat` measures that surface deterministically and helps you keep it light.
+## What changed in v1.1
 
-- **Deterministic.** Pure byte/token arithmetic (`chars / 4`, labelled `MEASURED~`). No LLM
-  judgment, so the number cannot be rationalized away.
-- **Non-blocking.** It measures and suggests. You choose what to trim. It never forces anything.
-- **Loss-free.** Trimming means moving accreted *history* into a `*-history` file and leaving a
-  one-line pointer. Nothing is deleted.
-- **Zero dependencies.** A single Node script (Node 18+).
+- Discovers agent-specific instruction files.
+- Deduplicates symlinks by real path.
+- Reports UTF-8 bytes, Unicode characters, and estimated tokens separately.
+- Uses configurable defaults of 8k tokens for `watch`, 16k for `heavy`, and 4k per file.
+- Provides deterministic trim plans with a read-only diff.
+- Creates backups before writing and verifies SHA-256 hashes after writing.
+- Includes Node tests for Unicode, symlinks, discovery, invalid config, missing files, and trims.
+- Works from both Claude Code and Codex skill locations.
 
-## Install
+## Install as a skill
 
-**As a Claude Code skill (recommended).** Copy the `debloat/` folder into your project's
-`.claude/skills/`:
+Copy this directory into the location used by your agent.
 
-```
-your-project/
-  .claude/
-    skills/
-      debloat/
-        SKILL.md
-        context-hygiene.mjs
+Claude Code project skill:
+
+```text
+.claude/skills/debloat/
 ```
 
-Then invoke it with `/debloat`, or wire the one-line check into a session-start hook.
+Codex project skill:
 
-**Standalone (any agent, or just your shell).** It is one dependency-free Node script. Run it
-directly:
+```text
+.agents/skills/debloat/
+```
 
+Codex user skill:
+
+```text
+~/.agents/skills/debloat/
 ```
-node context-hygiene.mjs          # full report
-node context-hygiene.mjs --fyi    # one line
-node context-hygiene.mjs --json   # machine-readable
+
+Invoke `debloat` from Claude Code or `$debloat` from Codex. The instructions resolve scripts from
+the installed skill directory instead of assuming one agent-specific path.
+
+## Measure
+
+Run automatic discovery:
+
+```bash
+node context-hygiene.mjs
+node context-hygiene.mjs --fyi
+node context-hygiene.mjs --json
 ```
+
+Limit discovery to one agent:
+
+```bash
+node context-hygiene.mjs --agent codex
+node context-hygiene.mjs --agent claude
+node context-hygiene.mjs --agent cursor
+```
+
+The JSON report keeps the v1 `total_tok`, `tok`, `ref`, `files`, and `targets` fields while adding
+explicit `total_tokens_estimate`, `total_characters`, `total_bytes`, aliases, discovery reasons,
+and missing files.
+
+The estimate is `Unicode characters / 4`, labelled `ESTIMATED~`. It is deterministic but is not an
+exact model tokenizer count. Bytes and characters remain visible so multilingual files do not get
+silently measured as ASCII.
+
+## Discovery
+
+Automatic mode checks all supported agent conventions and counts each real file once.
+
+| Agent | Discovered surface |
+| --- | --- |
+| Codex | Global instructions plus the active `AGENTS.override.md`, `AGENTS.md`, or configured fallback at each project level |
+| Claude Code | Managed, user, ancestor, local, imported, and unconditional `.claude/rules/*.md` instructions |
+| Cursor | Root CLI rules, legacy `.cursorrules`, and `.cursor/rules/*.mdc` files with `alwaysApply: true` |
+
+Conditional Claude and Cursor rules are excluded because they are not always loaded. Runtime user
+rules stored inside an editor, agent system prompts, and conditionally injected context cannot be
+measured from repository files. Use `--include <path>` for additional known files.
 
 ## Configure
 
-Tell `debloat` which files are "always-loaded" via a `.debloat.json` in your project root:
+Create `.debloat.json` in the inspected root:
 
 ```json
 {
-  "surface": ["CLAUDE.md", "AGENTS.md", ".claude/rules.md"],
-  "thresholds": { "watch": 45000, "heavy": 55000 },
-  "perFileSoft": { "CLAUDE.md": 6000 }
+  "agents": ["codex"],
+  "discover": true,
+  "surface": ["docs/always-loaded-state.md"],
+  "thresholds": { "watch": 8000, "heavy": 16000 },
+  "perFileSoft": { "*": 4000, "AGENTS.md": 6000 },
+  "journal": ".debloat/history.jsonl"
 }
 ```
 
 | Key | Meaning |
-|-----|---------|
-| `surface` | The files loaded on every session start. Defaults to `CLAUDE.md` + `AGENTS.md`. |
-| `thresholds` | Token weight labels: `light` < `watch`, `watch` >= `watch` (or a heavy file present), `heavy` >= `heavy`. |
-| `perFileSoft` | Per-file soft ceilings. A file over its ceiling is flagged as a trim target. |
-| `journal` | Optional path for append-only weight telemetry. Off by default. |
+| --- | --- |
+| `agents` | `codex`, `claude`, `cursor`, `auto`, or `all` |
+| `discover` | Enable agent-specific discovery |
+| `surface` | Additional files to measure |
+| `thresholds` | Total estimated-token levels for `watch` and `heavy` |
+| `perFileSoft` | Per-file soft ceilings, with `*` as the fallback |
+| `journal` | Optional append-only telemetry path inside the inspected root |
 
-No config? It measures `CLAUDE.md` + `AGENTS.md` with sensible defaults. CLI overrides:
-`--include <path>` (repeatable), `--root <dir>`, `--config <path>`.
+Use `--no-discover` to measure only `surface` and `--include` entries. Invalid configuration exits
+with an error instead of silently falling back.
 
-## Usage
+## Preview and apply a trim
 
-### One-line check (session-start hook)
+Create a plan with inclusive, one-based line ranges:
 
-```
-$ node .claude/skills/debloat/context-hygiene.mjs --fyi
-context: ~48.3k tok always-load (watch) | heavy: rules.md 10223t - /debloat to trim
-```
-
-### Full report
-
-```
-$ node .claude/skills/debloat/context-hygiene.mjs
-============================================================
-CONTEXT WEIGHT  2026-08-01T00:00:00.000Z
-============================================================
-  always-load surface: 48,300 tok  (~189 KB)   [MEASURED~ chars/4]
-  reference: light <45k / watch <55k / heavy >=55k
-  weight: watch
-
-  file weights (heaviest first):
-     10223 tok  .claude/rules.md   <-- heavy (soft 6000)
-      ...
-  suggested trim targets (you choose what moves):
-    * .claude/rules.md is 10223 tok (soft 6000). Move accreted history to a *-history file; keep current state + a pointer.
+```json
+{
+  "source": "AGENTS.md",
+  "history": "AGENTS-history.md",
+  "pointer": "Historical notes: see [AGENTS-history.md](AGENTS-history.md).",
+  "ranges": [{ "start": 42, "end": 78 }]
+}
 ```
 
-### Interactive trim (via the skill)
+Preview the complete affected diff without changing files:
 
-Invoke `/debloat` in Claude Code. It measures, shows you the heaviest files and suggested targets,
-asks which to trim, then for each one moves the accreted history into a `*-history` file and leaves
-a pointer, re-measuring so you see the drop.
+```bash
+node trim-context.mjs --plan .debloat/trim-plan.json --dry-run
+```
 
-## The trim discipline
+After reviewing the diff, apply it:
 
-1. Identify the **accreted history** in a heavy file (dated log prose, superseded notes) versus its
-   **current state**.
-2. Append that history to a matching `*-history` file (create if absent).
-3. Leave the source file with current state + a one-line pointer to the history.
-4. **Never delete.** Never trim immutable or append-only records, or transaction data.
+```bash
+node trim-context.mjs --plan .debloat/trim-plan.json --apply --review-token <token-from-dry-run>
+```
+
+The dry run prints the review token. It hashes the source, existing history, and normalized plan.
+If any of them changes before apply, the command refuses to write and requires a new preview.
+
+The apply command:
+
+1. Resolves and validates all paths inside the project root.
+2. Confirms that the review token and current files match the preview.
+3. Creates `.debloat/backups/<timestamp>/` before changing files.
+4. Copies the original source and existing history file into the backup.
+5. Appends selected lines unchanged inside marked history blocks.
+6. Replaces the selected ranges with one pointer.
+7. Writes atomically and verifies source, history, backup, and extracted content.
+8. Restores the original files if verification fails.
+
+Never use trim plans for immutable logs, transaction data, generated audit records, or any content
+whose retention rules are uncertain.
+
+## Test
+
+```bash
+npm test
+```
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
----
 
 Built by [Sibyl Labs](https://sibyllabs.org).
