@@ -1,0 +1,26 @@
+{
+  "name": "@sibyl-labs/debloat",
+  "version": "1.1.0",
+  "description": "Context hygiene for AI coding agents: measure and trim the always-load surface",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sibyl-Labs/debloat.git"
+  },
+  "files": [
+    "context-hygiene.mjs",
+    "trim-context.mjs",
+    "lib/",
+    "agents/",
+    "SKILL.md",
+    ".debloat.example.json",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

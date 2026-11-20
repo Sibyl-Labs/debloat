@@ -1,6 +1,8 @@
 {
-  "surface": ["CLAUDE.md", "AGENTS.md", ".claude/rules.md"],
-  "thresholds": { "watch": 45000, "heavy": 55000 },
-  "perFileSoft": { "CLAUDE.md": 6000 },
+  "agents": ["claude"],
+  "surface": ["docs/always-loaded-state.md"],
+  "discover": true,
+  "thresholds": { "watch": 8000, "heavy": 16000 },
+  "perFileSoft": { "*": 4000, "CLAUDE.md": 6000 },
   "journal": ".debloat/history.jsonl"
 }

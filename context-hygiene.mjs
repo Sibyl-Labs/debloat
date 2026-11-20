@@ -3,8 +3,9 @@
 //
 // "debloat" measures what your agent loads on EVERY session start (its instruction files, rules,
 // and any always-read state files) and reports the weight plus the heaviest files, so you can keep
-// the always-load surface light. Pure byte/token arithmetic (chars/4, labelled MEASURED~), no LLM
-// judgment, so the number cannot be rationalized away.
+// the always-load surface light. Pure arithmetic, no LLM judgment, so the number cannot be
+// rationalized away. It reports UTF-8 bytes, Unicode characters and estimated tokens separately;
+// the token figure is chars/4, labelled ESTIMATE~, not an exact tokenizer count.
 //
 // Environment hygiene, not a gate: it never blocks a session and never forces a trim. You decide.
 //
@@ -13,108 +14,85 @@
 //   --json    machine-readable record (drives an interactive trim pass).
 //   (default) full human report: file weights + suggested trim targets.
 //
+// Surface: discovered for Claude Code, Codex and Cursor (--agent <name>, repeatable; default all
+// three), plus anything you declare. A "surface" list in the config is taken as the whole surface
+// unless "discover": true or --agent is given. --no-discover measures declared files only.
+//
 // Config (optional): a .debloat.json in the root, or --config <path>:
-//   { "surface": ["CLAUDE.md", "AGENTS.md"],
-//     "thresholds": { "watch": 45000, "heavy": 55000 },
-//     "perFileSoft": { "CLAUDE.md": 6000 },
+//   { "agents": ["claude"],
+//     "surface": ["docs/always-loaded-state.md"], "discover": true,
+//     "thresholds": { "watch": 8000, "heavy": 16000 },
+//     "perFileSoft": { "*": 4000, "CLAUDE.md": 6000 },
 //     "journal": ".debloat/history.jsonl" }
 // You can also list files on the CLI with --include <path> (repeatable).
 //
-// Always exits 0. Node 18+ (no dependencies).
-// Usage: node context-hygiene.mjs [--fyi|--json] [--root <dir>] [--config <path>] [--include <path>]...
+// Always exits 0. Problems are warnings on stderr. Node 18+ (no dependencies).
+// Usage: node context-hygiene.mjs [--fyi|--json] [--root <dir>] [--config <path>]
+//          [--agent <claude|codex|cursor|all>]... [--include <path>]... [--no-discover]
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { loadConfig, measure } from './lib/surface.mjs';
 
 const args = process.argv.slice(2);
 const flag = (n) => args.includes(n);
 const opt = (n, d) => { const i = args.indexOf(n); return i >= 0 && args[i + 1] ? args[i + 1] : d; };
 const opts = (n) => { const out = []; for (let i = 0; i < args.length; i++) if (args[i] === n && args[i + 1]) out.push(args[i + 1]); return out; };
 
-const ROOT = path.resolve(opt('--root', process.cwd()));
-const AS_JSON = flag('--json');
-const AS_FYI = flag('--fyi');
+if (flag('--help') || flag('-h')) {
+  console.log(`Usage: node context-hygiene.mjs [options]
 
-// ---- config resolution -------------------------------------------------------------------
-const DEFAULTS = {
-  surface: ['CLAUDE.md', 'AGENTS.md'],
-  thresholds: { watch: 45000, heavy: 55000 },
-  perFileSoft: {},
-  journal: null, // set to a path (relative to root or absolute) to enable append-only telemetry
-};
-function loadConfig() {
-  const cfgPath = opt('--config', path.join(ROOT, '.debloat.json'));
-  if (fs.existsSync(cfgPath)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-      return {
-        ...DEFAULTS, ...parsed,
-        thresholds: { ...DEFAULTS.thresholds, ...(parsed.thresholds || {}) },
-        perFileSoft: { ...DEFAULTS.perFileSoft, ...(parsed.perFileSoft || {}) },
-      };
-    } catch (e) { console.error(`debloat: could not parse ${cfgPath}: ${e.message}`); }
-  }
-  return { ...DEFAULTS };
+  --fyi              one summary line (for a session-start hook)
+  --json             machine-readable record
+  --root <dir>       project root to inspect (default: current directory)
+  --config <path>    config file (default: <root>/.debloat.json)
+  --agent <name>     claude, codex, cursor or all (repeatable; default: all)
+  --include <path>   add a file to the measured surface (repeatable)
+  --no-discover      measure only declared and included files
+
+Always exits 0. To move history out of a heavy file, see trim-context.mjs.`);
+  process.exit(0);
 }
-const CFG = loadConfig();
 
-// surface = config surface + any --include, de-duplicated
-const surfaceList = [...new Set([...(CFG.surface || []), ...opts('--include')])];
+let ROOT = path.resolve(opt('--root', process.cwd()));
+try { ROOT = fs.realpathSync(ROOT); } catch { /* a missing root measures as empty */ }
 
-const tok = (bytes) => Math.round(bytes / 4); // deterministic approx (chars/4), labelled MEASURED~
+const { config: CFG, warnings } = loadConfig({ root: ROOT, configPath: opt('--config', null) });
 
 // ---- MEASURE (deterministic) -------------------------------------------------------------
-const files = [];
-let totalBytes = 0;
-for (const rel of surfaceList) {
-  const abs = path.isAbsolute(rel) ? rel : path.join(ROOT, rel);
-  let bytes = 0;
-  try { const st = fs.statSync(abs); if (!st.isFile()) continue; bytes = st.size; } catch { continue; }
-  totalBytes += bytes;
-  const t = tok(bytes);
-  const soft = CFG.perFileSoft[rel];
-  files.push({ file: rel, bytes, tok: t, soft: soft ?? null, heavy: soft != null && t > soft });
+let record;
+try {
+  record = measure({ root: ROOT, config: CFG, includes: opts('--include'), agents: opts('--agent'), noDiscover: flag('--no-discover'), warnings });
+} catch (e) { // never a gate: report and leave quietly
+  console.error(`debloat: measurement failed: ${e.message}`);
+  process.exit(0);
 }
-const totalTok = tok(totalBytes);
-const WATCH = CFG.thresholds.watch, HEAVY = CFG.thresholds.heavy;
-
-// suggested trim targets (informational)
-const targets = [];
-for (const f of files) if (f.heavy) {
-  targets.push({ kind: 'file_heavy', file: f.file, tok: f.tok, soft: f.soft,
-    suggestion: `${f.file} is ${f.tok} tok (soft ${f.soft}). Move accreted history to a *-history file; keep current state + a pointer.` });
-}
-if (!targets.length && files.length && totalTok >= WATCH) {
-  const biggest = [...files].sort((a, b) => b.tok - a.tok)[0];
-  targets.push({ kind: 'file_largest', file: biggest.file, tok: biggest.tok, soft: biggest.soft,
-    suggestion: `${biggest.file} is the heaviest at ${biggest.tok} tok. If it carries accreted history, extract it to a *-history file.` });
-}
-
-// weight label (informational, never blocks)
-let weight = 'light';
-if (totalTok >= HEAVY) weight = 'heavy';
-else if (totalTok >= WATCH || targets.length) weight = 'watch';
-
-const record = {
-  ts: new Date().toISOString(), root: ROOT, total_tok: totalTok, total_bytes: totalBytes,
-  ref: { watch: WATCH, heavy: HEAVY }, weight,
-  files: files.map((f) => ({ file: f.file, tok: f.tok, soft: f.soft, heavy: f.heavy })),
-  targets: targets.map((t) => ({ file: t.file, kind: t.kind, tok: t.tok, soft: t.soft, suggestion: t.suggestion })),
-};
+for (const w of record.warnings) console.error(`debloat: ${w}`);
+const { files, targets, weight, total_tok: totalTok } = record;
+const WATCH = record.ref.watch, HEAVY = record.ref.heavy;
 
 // ---- OBSERVE: optional append-only telemetry (best-effort, never throws) ------------------
+// The journal must resolve inside the root, so a config cannot make a hook write elsewhere.
 if (CFG.journal) {
   try {
-    const jp = path.isAbsolute(CFG.journal) ? CFG.journal : path.join(ROOT, CFG.journal);
+    const inside = (p) => { const rel = path.relative(ROOT, p); return !rel.startsWith('..') && !path.isAbsolute(rel); };
+    const jp = path.resolve(ROOT, CFG.journal);
+    let anchor = jp; // nearest existing path, resolved through any symlinks
+    while (!fs.existsSync(anchor) && anchor !== path.dirname(anchor)) anchor = path.dirname(anchor);
+    if (!inside(jp) || !inside(fs.realpathSync(anchor))) throw new Error('journal path must stay inside the root');
     fs.mkdirSync(path.dirname(jp), { recursive: true });
-    fs.appendFileSync(jp, JSON.stringify({ ts: record.ts, total_tok: totalTok, weight, targets: targets.length }) + '\n');
-  } catch { /* telemetry is best-effort */ }
+    fs.appendFileSync(jp, JSON.stringify({ ts: record.ts, total_tok: totalTok, total_chars: record.total_chars, total_bytes: record.total_bytes, weight, targets: targets.length }) + '\n');
+  } catch (e) { console.error(`debloat: journal skipped: ${e.message}`); }
 }
 
 // ---- OUTPUT ------------------------------------------------------------------------------
-if (AS_JSON) { console.log(JSON.stringify(record, null, 2)); process.exit(0); }
+if (flag('--json')) {
+  const out = { ...record, files: files.map(({ declared, ...f }) => f) };
+  console.log(JSON.stringify(out, null, 2));
+  process.exit(0);
+}
 
-if (AS_FYI) {
+if (flag('--fyi')) {
   const heavyList = files.filter((f) => f.heavy).map((f) => `${f.file.split('/').pop()} ${f.tok}t`);
   const spots = heavyList.length ? ` | heavy: ${heavyList.join(', ')}` : '';
   const hint = weight === 'light' ? '' : ' - /debloat to trim';
@@ -123,24 +101,40 @@ if (AS_FYI) {
 }
 
 const bar = '='.repeat(60);
+const n = (v) => v.toLocaleString('en-US');
 console.log(bar);
 console.log(`CONTEXT WEIGHT  ${record.ts}`);
 console.log(bar);
 if (!files.length) {
   console.log('  no always-load files found.');
-  console.log(`  looked for: ${surfaceList.join(', ') || '(none)'}`);
+  if (record.agents.length) console.log(`  discovery ran for: ${record.agents.join(', ')}`);
+  if (record.missing.length) console.log(`  declared but missing: ${record.missing.join(', ')}`);
   console.log('  set "surface" in .debloat.json or pass --include <file>.');
   console.log(bar);
   process.exit(0);
 }
-console.log(`  always-load surface: ${totalTok.toLocaleString()} tok  (~${(totalBytes / 1024).toFixed(0)} KB)   [MEASURED~ chars/4]`);
+console.log(`  always-load surface: ${n(totalTok)} tok   [ESTIMATE~ chars/4]`);
+console.log(`  measured: ${n(record.total_chars)} chars / ${n(record.total_bytes)} bytes in ${files.length} file${files.length === 1 ? '' : 's'}`);
 console.log(`  reference: light <${WATCH / 1000}k / watch <${HEAVY / 1000}k / heavy >=${HEAVY / 1000}k`);
 console.log(`  weight: ${weight}`);
+if (record.agents.length > 1) {
+  console.log('');
+  console.log('  per agent (a file shared by several agents counts once in the total):');
+  for (const a of record.agents) console.log(`    ${String(record.by_agent[a].tok).padStart(6)} tok  ${a} (${record.by_agent[a].files} file${record.by_agent[a].files === 1 ? '' : 's'})`);
+} else if (record.agents.length) {
+  console.log(`  agent: ${record.agents[0]}`);
+}
 console.log('');
 console.log('  file weights (heaviest first):');
-for (const f of [...files].sort((a, b) => b.tok - a.tok)) {
+for (const f of files) {
   const mark = f.heavy ? '  <-- heavy (soft ' + f.soft + ')' : (f.soft ? '  (soft ' + f.soft + ')' : '');
-  console.log(`    ${String(f.tok).padStart(6)} tok  ${f.file}${mark}`);
+  const also = [...f.aliases, ...(f.real ? [`-> ${f.real}`] : [])];
+  console.log(`    ${String(f.tok).padStart(6)} tok  ${String(f.chars).padStart(7)} ch  ${String(f.bytes).padStart(7)} B  ${f.file}${mark}`);
+  if (also.length) console.log(`${' '.repeat(39)}same file: ${also.join(', ')}`);
+}
+if (record.missing.length) {
+  console.log('');
+  console.log(`  declared but missing: ${record.missing.join(', ')}`);
 }
 if (targets.length) {
   console.log('');
